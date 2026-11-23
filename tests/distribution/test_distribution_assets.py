@@ -179,3 +179,25 @@ def test_agent_skill_is_loadable_and_names_only_real_tools() -> None:
     named = set(re.findall(r"`((?:get|list|search|read|build|mark|start|export|acknowledge)_[a-z_]+)", body))
     assert named and named <= real_tools, sorted(named - real_tools)
     assert "/Users/" not in text and "C:\\Users\\" not in text
+
+
+def test_every_repository_link_names_the_owner_in_pyproject() -> None:
+    """A link to another owner sends installs to whoever holds that name."""
+    import re
+    import tomllib
+
+    project = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))["project"]
+    home = project["urls"]["Repository"]
+    pattern = re.compile(r"https://github\.com/[\w.-]+/uriboMCP\b", re.IGNORECASE)
+    files = [
+        ROOT / "README.md",
+        ROOT / "SECURITY.md",
+        ROOT / "pyproject.toml",
+        ROOT / "skills" / "uribo-mcp" / "SKILL.md",
+        *sorted((ROOT / "docs").glob("*.md")),
+    ]
+    found = {
+        (path.name, link) for path in files for link in pattern.findall(path.read_text("utf-8"))
+    }
+    assert len(found) >= 5
+    assert {link for _, link in found} == {home}

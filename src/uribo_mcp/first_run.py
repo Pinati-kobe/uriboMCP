@@ -33,7 +33,7 @@ class SourceOption:
 SOURCES: tuple[SourceOption, ...] = (
     SourceOption("beef", "BEEF+", "授業資料・課題・お知らせ", required=True),
     SourceOption("uribo", "うりぼーネット", "掲示"),
-    SourceOption("csi", "システム情報学部サイト", "在学生向けお知らせ"),
+    SourceOption("csi", "システム情報学部サイト", "在学生向けお知らせ", default=False),
     SourceOption("pdf_calendar", "学年暦", "PDF"),
     SourceOption("newsnet", "神戸大学ニュースネット"),
     SourceOption("venture", "BEEF+ Venture", "特定の1コースのみ対応", default=False),

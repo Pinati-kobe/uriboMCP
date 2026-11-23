@@ -56,6 +56,7 @@ def test_plan_places_everything_under_the_storage_folder(tmp_path: Path) -> None
     assert plan.sources == first_run.DEFAULT_SOURCES
     assert "moodle" in plan.sources
     assert "mail" not in plan.sources and "venture" not in plan.sources
+    assert "csi" not in plan.sources  # one faculty's site: opt-in
 
 
 def test_plan_accepts_individual_locations(tmp_path: Path) -> None:

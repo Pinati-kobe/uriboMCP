@@ -114,10 +114,10 @@ uv run uribo-mcp doctor
 まず、ログインの要らない情報で動作を確かめる（数秒〜数十秒）。
 
 ```powershell
-uv run uribo-mcp refresh --scope csi --wait
+uv run uribo-mcp refresh --scope newsnet --wait
 ```
 
-`csi` をフォームで外した場合は、`newsnet` など有効にした情報の ID に置き換える。
+`newsnet` をフォームで外した場合は、`pdf_calendar` など有効にした情報の ID に置き換える。
 `"status": "completed"` を確認したら、全体の同期をバックグラウンドで始める。
 
 ```powershell

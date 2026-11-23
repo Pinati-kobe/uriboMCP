@@ -601,3 +601,130 @@ def test_login_round_trips_through_the_real_windows_keyring(tmp_path: Path) -> N
     finally:
         store.delete(USERNAME_KEY)
         store.delete(PASSWORD_KEY)
+
+
+# ------------------------------------------------------- login check on save
+class _Check:
+    def __init__(self, status: str, detail: str = "", cookies: tuple = ()) -> None:
+        self.status, self.detail, self.cookies = status, detail, cookies
+
+
+def _verified_ui(tmp_path: Path, verifier):
+    root = tmp_path / "project"
+    root.mkdir()
+    store = MemoryStore()
+    session = SetupSession(
+        root=root,
+        config_path=root / "config.local.toml",
+        initial=first_run.build_plan(tmp_path / "store"),
+        secret_store=store,
+        verifier=verifier,
+    )
+    return session, start_server(session), store
+
+
+def _save(server, session, tmp_path: Path, password: str):
+    return _request(
+        server,
+        "/api/save",
+        token=session.token,
+        body={
+            "storage_dir": str(tmp_path / "store"),
+            "sources": ["csi"],
+            "username": "1234567x",
+            "password": password,
+        },
+    )
+
+
+def test_ui_asks_again_when_knossos_rejects_the_login(tmp_path: Path) -> None:
+    tried: list[str] = []
+
+    def verifier(username: str, password: str):
+        tried.append(password)
+        cookies = ({"name": "JSESSIONID", "value": "v", "domain": "beefplus.center.kobe-u.ac.jp"},)
+        return _Check("ok", cookies=cookies) if password == "right-one" else _Check("rejected")
+
+    session, server, store = _verified_ui(tmp_path, verifier)
+    try:
+        status, body, _ = _save(server, session, tmp_path, "typo-secret")
+        assert status == 400 and json.loads(body)["closed"] is False
+        assert "あと2回" in json.loads(body)["error"] and "typo-secret" not in body
+        assert store.values == {} and not session.done.is_set()
+        assert not (session.root / "config.local.toml").exists()
+
+        status, body, _ = _save(server, session, tmp_path, "right-one")
+        assert status == 200, body
+        assert json.loads(body)["warnings"] == []
+    finally:
+        server.shutdown()
+        server.server_close()
+    assert tried == ["typo-secret", "right-one"]
+    assert store.get(PASSWORD_KEY) == "right-one"
+    assert session.result["kobe_credentials_verified"] is True
+    # The confirming login is kept, so the first sync does not sign in again.
+    from uribo_mcp.auth import CookieVault
+
+    assert CookieVault(tmp_path / "store" / "credentials").load("beef")[0]["name"] == "JSESSIONID"
+
+
+def test_ui_closes_after_three_rejected_logins(tmp_path: Path) -> None:
+    session, server, store = _verified_ui(tmp_path, lambda u, p: _Check("rejected"))
+    try:
+        replies = [_save(server, session, tmp_path, f"guess-{n}") for n in range(3)]
+        assert [status for status, _, _ in replies] == [400, 400, 400]
+        assert [json.loads(body)["closed"] for _, body, _ in replies] == [False, False, True]
+        assert session.done.is_set() and session.result["reason"] == "credentials_rejected"
+        status, body, _ = _save(server, session, tmp_path, "guess-4")
+        assert status == 400 and json.loads(body)["closed"] is True
+    finally:
+        server.shutdown()
+        server.server_close()
+    assert store.values == {} and not (session.root / "config.local.toml").exists()
+
+
+def test_ui_stores_a_login_it_could_not_check_and_warns(tmp_path: Path) -> None:
+    session, server, store = _verified_ui(
+        tmp_path, lambda u, p: _Check("unverified", "the browser did not start: OSError")
+    )
+    try:
+        status, body, _ = _save(server, session, tmp_path, "hunter2-secret")
+    finally:
+        server.shutdown()
+        server.server_close()
+    assert status == 200, body
+    assert store.get(PASSWORD_KEY) == "hunter2-secret"
+    assert session.result["kobe_credentials_verified"] is None
+    assert any("確認できませんでした" in text for text in json.loads(body)["warnings"])
+
+
+def test_ui_does_not_spend_a_login_on_an_unusable_folder(tmp_path: Path) -> None:
+    session, server, store = _verified_ui(tmp_path, lambda u, p: pytest.fail("login tried"))
+    try:
+        status, _, _ = _request(
+            server,
+            "/api/save",
+            token=session.token,
+            body={"storage_dir": "relative", "sources": ["csi"], "username": "u", "password": "p"},
+        )
+    finally:
+        server.shutdown()
+        server.server_close()
+    assert status == 400 and store.values == {}
+
+
+def test_cli_passes_no_verifier_with_no_verify(tmp_path: Path, monkeypatch, capsys) -> None:
+    from uribo_mcp import first_run_ui
+
+    seen = {}
+
+    def fake_ui(**kwargs):
+        seen.update(kwargs)
+        return {"ok": True}
+
+    monkeypatch.setattr(first_run_ui, "run_setup_ui", fake_ui)
+    main(["--root", str(tmp_path), "setup", "--storage-dir", str(tmp_path / "s"), "--no-verify"])
+    assert seen["verifier"] is None
+    main(["--root", str(tmp_path), "setup", "--storage-dir", str(tmp_path / "s")])
+    assert callable(seen["verifier"])
+    capsys.readouterr()

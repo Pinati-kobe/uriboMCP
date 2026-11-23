@@ -4,6 +4,9 @@ The form exists so a person can type their university password into the OS
 keyring without it passing through a terminal transcript or an AI agent. The
 server listens on the loopback interface only, for one setup, and requires a
 random token on every request.
+
+Before a login is stored it is tried once against KNOSSOS. A rejected login is
+not stored and the form asks for it again, a limited number of times.
 """
 
 from __future__ import annotations
@@ -25,6 +28,12 @@ from uribo_mcp.errors import ConfigurationError, UriboMcpError
 
 TOKEN_HEADER = "X-Uribo-Setup-Token"
 MAX_BODY_BYTES = 64 * 1024
+# Every rejected entry is a failed sign-in on the university account.
+MAX_REJECTED_LOGINS = 3
+
+
+class LoginRejected(ConfigurationError):
+    """KNOSSOS rejected the login typed into the form; nothing was stored."""
 
 
 class SetupSession:
@@ -37,11 +46,16 @@ class SetupSession:
         config_path: Path,
         initial: first_run.SetupPlan,
         secret_store=None,
+        verifier=None,
     ):
         self.root = root
         self.config_path = config_path
         self.initial = initial
         self.secret_store = secret_store
+        # ``verifier(username, password)`` returns an object with ``status``
+        # ("ok", "rejected" or "unverified"), ``detail`` and ``cookies``.
+        self.verifier = verifier
+        self.rejected_logins = 0
         self.token = secrets.token_urlsafe(24)
         self.done = threading.Event()
         self.result: dict[str, Any] | None = None
@@ -102,6 +116,7 @@ class SetupSession:
                 raise ConfigurationError("この設定フォームは保存済みです")
             if not username and not self._credentials_stored():
                 raise ConfigurationError("ログインIDとパスワードを入力してください")
+            check = self._check_login(username, password) if username else None
             # Folders and config first, so a failure there leaves the keyring untouched.
             result = first_run.apply_setup(
                 plan,
@@ -112,9 +127,51 @@ class SetupSession:
             )
             if username:
                 first_run.store_credentials(username, password, self.secret_store)
+            if check is not None:
+                result["kobe_credentials_verified"] = True if check.status == "ok" else None
+                if check.status == "ok":
+                    self._keep_session(plan, check)
+                else:
+                    result["kobe_credentials_check_detail"] = check.detail
+                    result["warnings"].append(
+                        "ログインを確認できませんでした。最初の同期で確認されます"
+                    )
             self.result = result
             self.done.set()
         return result
+
+    def _check_login(self, username: str, password: str):
+        """Try the typed login once; raise LoginRejected if KNOSSOS refuses it."""
+        if self.verifier is None:
+            return None
+        check = self.verifier(username, password)
+        if check.status != "rejected":
+            return check
+        self.rejected_logins += 1
+        left = MAX_REJECTED_LOGINS - self.rejected_logins
+        if left > 0:
+            raise LoginRejected(
+                f"ログインIDかパスワードが違います。入力し直してください（あと{left}回）"
+            )
+        # Stop here: more wrong attempts could lock the university account.
+        message = (
+            "ログインIDかパスワードが違います。大学のログインページで確認してから、"
+            "セットアップをやり直してください"
+        )
+        self.result = {"ok": False, "reason": "credentials_rejected", "detail": message}
+        self.done.set()
+        raise LoginRejected(message)
+
+    def _keep_session(self, plan: first_run.SetupPlan, check) -> None:
+        """Save the cookies of the confirming login so the first sync reuses them."""
+        if not check.cookies:
+            return
+        try:
+            from uribo_mcp.auth import CookieVault
+
+            CookieVault(plan.credentials_dir).save("beef", list(check.cookies))
+        except Exception:
+            pass  # the first sync signs in again
 
 
 class _Server(ThreadingHTTPServer):
@@ -222,13 +279,20 @@ def _make_handler(session: SetupSession):
             try:
                 result = session.save(payload)
             except UriboMcpError as exc:
-                self._json(400, {"error": str(exc)})
+                self._json(400, {"error": str(exc), "closed": session.done.is_set()})
             except OSError as exc:
                 self._json(400, {"error": f"フォルダを作成できません: {exc.strerror or exc}"})
             except Exception as exc:  # keyring backends raise their own types
                 self._json(500, {"error": f"{type(exc).__name__}: 資格情報を保存できませんでした"})
             else:
-                self._json(200, {"ok": True, "config_path": result["config_path"]})
+                self._json(
+                    200,
+                    {
+                        "ok": True,
+                        "config_path": result["config_path"],
+                        "warnings": result.get("warnings", []),
+                    },
+                )
 
     return Handler
 
@@ -252,10 +316,15 @@ def run_setup_ui(
     timeout: float = 900.0,
     secret_store=None,
     announce=None,
+    verifier=None,
 ) -> dict[str, Any]:
     """Serve the form until it is saved or ``timeout`` seconds pass."""
     session = SetupSession(
-        root=root, config_path=config_path, initial=initial, secret_store=secret_store
+        root=root,
+        config_path=config_path,
+        initial=initial,
+        secret_store=secret_store,
+        verifier=verifier,
     )
     server = start_server(session)
     url = setup_url(server, session)
@@ -285,4 +354,4 @@ def run_setup_ui(
         server.server_close()
 
 
-__all__ = ["SetupSession", "run_setup_ui", "setup_url", "start_server"]
+__all__ = ["LoginRejected", "SetupSession", "run_setup_ui", "setup_url", "start_server"]

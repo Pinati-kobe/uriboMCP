@@ -24,7 +24,12 @@ def _parser() -> argparse.ArgumentParser:
 
     auth = commands.add_parser("auth", help="configure local credentials")
     auth_commands = auth.add_subparsers(dest="auth_command", required=True)
-    auth_commands.add_parser("setup", help="store Kobe credentials in the OS keyring")
+    auth_setup = auth_commands.add_parser(
+        "setup", help="check the Kobe login once and store it in the OS keyring"
+    )
+    auth_setup.add_argument(
+        "--no-verify", action="store_true", help="store the login without trying it"
+    )
     auth_commands.add_parser("google", help="run Google OAuth for Gmail")
     auth_commands.add_parser("status", help="show setup state without secret values")
 
@@ -49,6 +54,11 @@ def _parser() -> argparse.ArgumentParser:
     setup.add_argument("--no-browser", action="store_true", help="print the form URL only")
     setup.add_argument("--force", action="store_true", help="replace an existing config")
     setup.add_argument("--timeout", type=float, default=900.0, help="seconds to wait for the form")
+    setup.add_argument(
+        "--no-verify",
+        action="store_true",
+        help="store the login typed into the form without trying it against KNOSSOS",
+    )
 
     refresh = commands.add_parser("refresh", help="start a background refresh")
     refresh.add_argument("--scope", default="all")
@@ -127,6 +137,7 @@ def run_setup(args) -> int:
                 initial=initial,
                 open_browser=not args.no_browser,
                 timeout=args.timeout,
+                verifier=None if args.no_verify else _login_verifier(),
             )
         else:
             if not args.storage_dir:
@@ -147,6 +158,27 @@ def run_setup(args) -> int:
         return 2
     _print(result)
     return 0 if result.get("ok") else 1
+
+
+def _login_verifier():
+    """One real KNOSSOS sign-in; imported lazily because it loads Selenium."""
+
+    def verify(username: str, password: str):
+        from uribo_mcp.live import check_kobe_login
+
+        return check_kobe_login(username, password)
+
+    return verify
+
+
+def _login_pause() -> str | None:
+    """Why automatic KNOSSOS sign-in is paused, if it is; never raises."""
+    from uribo_mcp.auth import load_credentials, login_block_reason
+
+    try:
+        return login_block_reason(load_credentials())
+    except Exception:
+        return None
 
 
 def doctor(settings) -> dict:
@@ -210,6 +242,12 @@ def doctor(settings) -> dict:
             "note": "Stored by `uribo-mcp setup` or `uribo-mcp auth setup`; values are never shown.",
         },
     }
+    paused = _login_pause()
+    checks["kobe_login"] = {
+        "ok": paused is None,
+        "required": False,
+        "note": paused or "Automatic KNOSSOS sign-in is not paused.",
+    }
     checks["ok"] = all(
         value.get("ok", True)
         for value in checks.values()
@@ -239,8 +277,16 @@ def main(argv: list[str] | None = None) -> int:
     settings = _settings(args)
     if args.command == "auth":
         if args.auth_command == "setup":
-            interactive_setup()
-            _print({"ok": True, "stored_in": "OS keyring"})
+            from uribo_mcp.errors import UriboMcpError
+
+            try:
+                verified = interactive_setup(
+                    verifier=None if args.no_verify else _login_verifier()
+                )
+            except UriboMcpError as exc:
+                _print({"ok": False, "error": str(exc)})
+                return 2
+            _print({"ok": True, "stored_in": "OS keyring", "verified": verified})
         elif args.auth_command == "google":
             from uribo_mcp.live import gmail_service
 
@@ -254,6 +300,7 @@ def main(argv: list[str] | None = None) -> int:
                     "credentials_directory": settings.paths.credentials_dir,
                     "google": google_token_summary(settings),
                     "kobe_credentials": "stored values are intentionally not displayed",
+                    "kobe_login_paused": _login_pause(),
                 }
             )
         return 0

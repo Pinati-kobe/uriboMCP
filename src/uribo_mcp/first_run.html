@@ -153,6 +153,7 @@
 
       <div class="actions">
         <button class="primary" type="submit" id="save">設定を保存</button>
+        <span class="context" id="checking" role="status" hidden>ログインを確認中…</span>
       </div>
       <div class="line error" id="error" role="alert" hidden>
         <svg width="16" height="16"><use href="#i-alert"/></svg>
@@ -169,6 +170,10 @@
   <div class="done" id="done-view" hidden>
     <h1>保存しました</h1>
     <div class="mono" id="done-path"></div>
+    <div class="line caution" id="done-warning" hidden>
+      <svg width="16" height="16"><use href="#i-alert"/></svg>
+      <span id="done-warning-text"></span>
+    </div>
     <div class="line"><span>このタブを閉じて、インストールを続けてください</span></div>
   </div>
 </div>
@@ -187,7 +192,11 @@
       body: body ? JSON.stringify(body) : undefined,
     });
     const data = await response.json().catch(() => ({}));
-    if (!response.ok) throw new Error(data.error || "保存できませんでした");
+    if (!response.ok) {
+      const error = new Error(data.error || "保存できませんでした");
+      error.closed = Boolean(data.closed);
+      throw error;
+    }
     return data;
   };
 
@@ -288,6 +297,7 @@
     showError("");
     const button = $("save");
     button.disabled = true;
+    $("checking").hidden = !$("username").value.trim();
     try {
       const result = await api("/api/save", {
         storage_dir: $("storage").value,
@@ -298,11 +308,21 @@
       });
       $("password").value = "";
       $("done-path").textContent = result.config_path;
+      const warnings = result.warnings || [];
+      $("done-warning-text").textContent = warnings.join(" / ");
+      $("done-warning").hidden = warnings.length === 0;
       $("form-view").hidden = true;
       $("done-view").hidden = false;
     } catch (error) {
       showError(error.message);
-      button.disabled = false;
+      // A closed form accepts nothing more: the setup has to be started again.
+      button.disabled = error.closed;
+      if (!error.closed && $("username").value.trim()) {
+        $("password").value = "";
+        $("password").focus();
+      }
+    } finally {
+      $("checking").hidden = true;
     }
   });
 

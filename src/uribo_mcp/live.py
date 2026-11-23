@@ -8,14 +8,22 @@ from __future__ import annotations
 
 from collections.abc import Iterator
 from contextlib import contextmanager
+from dataclasses import dataclass
 from urllib.parse import urlparse
 
 import requests
 
-from uribo_mcp.auth import CookieVault, load_credentials
+from uribo_mcp.auth import (
+    CookieVault,
+    KobeCredentials,
+    clear_login_state,
+    load_credentials,
+    login_block_reason,
+    record_login_failure,
+)
 from uribo_mcp.config import Settings
 from uribo_mcp.course.client import BeefReadOnlyClient
-from uribo_mcp.errors import AuthenticationRequired
+from uribo_mcp.errors import AuthenticationRequired, CredentialsRejected
 from uribo_mcp.moodle.client import MoodleReadOnlyClient
 from uribo_mcp.subprocesses import hidden_selenium_service_kwargs
 
@@ -74,10 +82,23 @@ def _inject_vault(driver, vault: CookieVault, source: str, base_url: str) -> boo
     return True
 
 
+def _credentials_for_login() -> KobeCredentials:
+    """Saved credentials, refused while automatic sign-in is paused.
+
+    Called before any SSO page is opened, so a missing login and a login that
+    KNOSSOS already rejected both cost no request.
+    """
+    credentials = load_credentials()
+    reason = login_block_reason(credentials)
+    if reason:
+        raise AuthenticationRequired(reason)
+    return credentials
+
+
 def _login_once(driver, start_url: str, expected_host: str) -> None:
     from selenium.webdriver.support.ui import WebDriverWait
 
-    credentials = load_credentials()  # fail before touching the SSO pages
+    credentials = _credentials_for_login()
     driver.get(start_url)
     wait = WebDriverWait(driver, 25)
     wait.until(
@@ -95,46 +116,145 @@ def _url_label(url: str) -> str:
     return f"{parsed.netloc}{parsed.path}"
 
 
-def _submit_knossos_form(driver, expected_host: str, credentials=None) -> None:
+def _form_shown_again(driver, submitted_field) -> bool:
+    """True when KNOSSOS has loaded a new page that asks for the password again.
+
+    That is how Keycloak answers a wrong login ID or password. The pages a
+    successful login passes through (SAML hand-over, an extra sign-in step)
+    have no password field, and the page that was submitted is told apart by
+    its password field still being attached.
+    """
+    from selenium.common.exceptions import StaleElementReferenceException, WebDriverException
+    from selenium.webdriver.common.by import By
+
+    if "knossos" not in urlparse(str(driver.current_url)).netloc:
+        return False
+    try:
+        submitted_field.is_enabled()
+        return False
+    except StaleElementReferenceException:
+        pass
+    except (AttributeError, WebDriverException):
+        return False
+    return bool(driver.find_elements(By.ID, "password"))
+
+
+def _submit_knossos_form(
+    driver, expected_host: str, credentials=None, *, track: bool = True
+) -> None:
     """Fill and submit the KNOSSOS form on the current page exactly once.
 
     Any failure after the submit click is reported as AuthenticationRequired
-    so the caller blocks further SSO attempts in the same run.
+    so the caller blocks further SSO attempts in the same run; a login that
+    KNOSSOS rejects is CredentialsRejected. With ``track`` the outcome is
+    recorded so later runs do not submit a failing login again.
     """
     from selenium.common.exceptions import TimeoutException
     from selenium.webdriver.common.by import By
     from selenium.webdriver.support.ui import WebDriverWait
 
-    credentials = credentials or load_credentials()
+    credentials = credentials or _credentials_for_login()
     wait = WebDriverWait(driver, 25)
     wait.until(lambda current: current.find_elements(By.ID, "username"))
+    password_field = driver.find_element(By.ID, "password")
     driver.find_element(By.ID, "username").send_keys(credentials.username)
-    driver.find_element(By.ID, "password").send_keys(credentials.password)
+    password_field.send_keys(credentials.password)
     # One attempt only. Retrying can lock the university account.
+    rejected = False
     try:
         try:
             driver.find_element(By.ID, "kc-login").click()
         except TimeoutException:
             pass
+
+        def settled(current) -> bool:
+            nonlocal rejected
+            if expected_host in urlparse(current.current_url).netloc:
+                return True
+            rejected = _form_shown_again(current, password_field)
+            return rejected
+
         # After the form, SAML hops through the IdP host before reaching the
         # service; wait for the service host itself, not merely "left KNOSSOS".
         try:
-            WebDriverWait(driver, 25).until(
-                lambda current: expected_host in urlparse(current.current_url).netloc
-            )
+            WebDriverWait(driver, 25).until(settled)
         except TimeoutException:
             pass
         final = urlparse(str(driver.current_url)).netloc
     except Exception as exc:
+        if track:
+            record_login_failure(credentials, rejected=False)
         raise AuthenticationRequired(
             f"KNOSSOS login was submitted but did not complete ({type(exc).__name__}); "
             "the server will not retry automatically."
         ) from exc
+    if rejected and expected_host not in final:
+        if track:
+            record_login_failure(credentials, rejected=True)
+        raise CredentialsRejected(
+            "KNOSSOS rejected the login ID or password. Automatic sign-in is paused until "
+            "the user runs `uv run uribo-mcp setup` (or `uv run uribo-mcp auth setup`) "
+            "and enters the login again."
+        )
     if "knossos" in final or expected_host not in final:
+        if track:
+            record_login_failure(credentials, rejected=False)
         raise AuthenticationRequired(
             "KNOSSOS login failed. Credentials, MFA, or the login page may have changed; "
             "the server will not retry automatically."
         )
+    if track:
+        clear_login_state()
+
+
+@dataclass(frozen=True)
+class LoginCheck:
+    """Result of trying a login once: ``ok``, ``rejected`` or ``unverified``."""
+
+    status: str
+    detail: str = ""
+    cookies: tuple[dict, ...] = ()
+
+
+def check_kobe_login(
+    username: str,
+    password: str,
+    *,
+    base_url: str = "https://beefplus.center.kobe-u.ac.jp",
+    driver_factory=None,
+) -> LoginCheck:
+    """Try a login against KNOSSOS once, for the setup, without storing anything.
+
+    ``unverified`` means the answer is unknown (no browser, no network, a
+    changed page, an extra sign-in step); only ``rejected`` says the login ID
+    or password is wrong. On ``ok`` the BEEF+ cookies are returned so the
+    first sync needs no second login.
+    """
+    from selenium.webdriver.support.ui import WebDriverWait
+
+    expected_host = urlparse(base_url).hostname or ""
+    try:
+        driver = (driver_factory or make_chrome_driver)()
+    except Exception as exc:
+        return LoginCheck("unverified", f"the browser did not start: {type(exc).__name__}")
+    try:
+        driver.get(base_url.rstrip("/") + "/saml/login?disco=true")
+        WebDriverWait(driver, 25).until(
+            lambda current: "knossos" in urlparse(str(current.current_url)).netloc
+        )
+        _submit_knossos_form(
+            driver, expected_host, KobeCredentials(username, password), track=False
+        )
+        return LoginCheck("ok", cookies=tuple(driver.get_cookies()))
+    except CredentialsRejected:
+        return LoginCheck("rejected")
+    except Exception as exc:
+        return LoginCheck("unverified", f"the sign-in did not complete: {type(exc).__name__}")
+    finally:
+        try:
+            driver.quit()
+        except Exception:
+            pass
 
 
 def _requests_from_driver(driver) -> requests.Session:
@@ -243,7 +363,7 @@ def open_moodle(
     if restored is not None:
         return restored
     if login is None:
-        load_credentials()  # fail before opening a browser or the SSO pages
+        _credentials_for_login()  # fail before opening a browser or the SSO pages
 
     def signed_in(url: str) -> bool:
         parsed = urlparse(url)
@@ -405,7 +525,9 @@ def google_token_summary(settings: Settings) -> dict[str, bool]:
 
 
 __all__ = [
+    "LoginCheck",
     "authenticated_lms",
+    "check_kobe_login",
     "fetch_uribo_html",
     "gmail_service",
     "google_token_summary",

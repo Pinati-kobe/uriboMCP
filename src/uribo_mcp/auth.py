@@ -5,20 +5,33 @@ from __future__ import annotations
 import base64
 import ctypes
 import getpass
+import hashlib
 import json
 import os
+import sys
+from collections.abc import Callable
 from ctypes import wintypes
 from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Protocol
+from typing import Any, Protocol
 
 from dotenv import dotenv_values
 
-from uribo_mcp.errors import AuthenticationRequired
+from uribo_mcp.errors import AuthenticationRequired, CredentialsRejected
 
 KEYRING_SERVICE = "uribo-mcp"
 USERNAME_KEY = "kobe-username"
 PASSWORD_KEY = "kobe-password"
+# Outcome of the last KNOSSOS form submissions. It lives next to the password
+# because it holds a fingerprint of the credentials that failed.
+LOGIN_STATE_KEY = "kobe-login-state"
+# A rejected password is never submitted again. A login that failed for an
+# unknown reason (timeout, changed page, extra sign-in step) is retried, but
+# after this many failures in a row only once per UNCONFIRMED_RETRY_HOURS.
+MAX_UNCONFIRMED_FAILURES = 3
+UNCONFIRMED_RETRY_HOURS = 24
+MAX_REJECTED_ENTRIES = 3
 
 
 class SecretStore(Protocol):
@@ -81,15 +94,153 @@ def load_credentials(
     return KobeCredentials(str(username), str(password))
 
 
-def interactive_setup(secret_store: SecretStore | None = None) -> None:
-    """Prompt in a terminal, never through MCP stdout."""
+def _state_store() -> SecretStore:
+    return KeyringSecretStore()
+
+
+def _fingerprint(credentials: KobeCredentials) -> str:
+    raw = f"{credentials.username}\0{credentials.password}".encode()
+    return hashlib.sha256(raw).hexdigest()
+
+
+def _read_login_state(store: SecretStore) -> dict[str, Any]:
+    try:
+        raw = store.get(LOGIN_STATE_KEY)
+        value = json.loads(raw) if raw else {}
+    except Exception:  # an unreadable keyring or entry must not stop a sync
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def login_block_reason(
+    credentials: KobeCredentials,
+    *,
+    secret_store: SecretStore | None = None,
+    now: datetime | None = None,
+) -> str | None:
+    """Why these credentials must not be submitted to KNOSSOS now, or ``None``.
+
+    Repeating a wrong password from every scheduled sync can lock the
+    university account, so a failure is remembered across runs. The record
+    applies only to the credentials that failed: saving a new login clears it.
+    """
+    state = _read_login_state(secret_store or _state_store())
+    if state.get("fingerprint") != _fingerprint(credentials):
+        return None
+    how_to_resume = (
+        "Automatic sign-in is paused. Ask the user to run `uv run uribo-mcp setup` "
+        "(or `uv run uribo-mcp auth setup`) and enter the login again."
+    )
+    if state.get("rejected"):
+        return (
+            f"KNOSSOS rejected the saved login ID or password ({state.get('at')}). "
+            + how_to_resume
+        )
+    try:
+        failures = int(state.get("failures") or 0)
+        last = datetime.fromisoformat(str(state.get("at")))
+    except (TypeError, ValueError):
+        return None
+    if failures < MAX_UNCONFIRMED_FAILURES:
+        return None
+    retry_at = last + timedelta(hours=UNCONFIRMED_RETRY_HOURS)
+    if (now or datetime.now(UTC)) >= retry_at:
+        return None
+    return (
+        f"KNOSSOS sign-in did not complete {failures} times in a row (last {state.get('at')}). "
+        f"The next automatic attempt is after {retry_at.isoformat()}. " + how_to_resume
+    )
+
+
+def record_login_failure(
+    credentials: KobeCredentials,
+    *,
+    rejected: bool,
+    secret_store: SecretStore | None = None,
+    now: datetime | None = None,
+) -> None:
+    """Remember a failed KNOSSOS submission for :func:`login_block_reason`."""
+    store = secret_store or _state_store()
+    fingerprint = _fingerprint(credentials)
+    previous = _read_login_state(store)
+    failures = 1
+    if previous.get("fingerprint") == fingerprint:
+        try:
+            failures = int(previous.get("failures") or 0) + 1
+        except (TypeError, ValueError):
+            failures = 1
+    state = {
+        "fingerprint": fingerprint,
+        "rejected": bool(rejected) or bool(
+            previous.get("fingerprint") == fingerprint and previous.get("rejected")
+        ),
+        "failures": failures,
+        "at": (now or datetime.now(UTC)).replace(microsecond=0).isoformat(),
+    }
+    try:
+        store.set(LOGIN_STATE_KEY, json.dumps(state, separators=(",", ":")))
+    except Exception:
+        pass
+
+
+def clear_login_state(secret_store: SecretStore | None = None) -> None:
+    """Forget recorded failures: after a successful login or a newly saved login."""
+    store = secret_store or _state_store()
+    try:
+        if store.get(LOGIN_STATE_KEY):
+            store.delete(LOGIN_STATE_KEY)
+    except Exception:
+        pass
+
+
+def interactive_setup(
+    secret_store: SecretStore | None = None,
+    *,
+    verifier: Callable[[str, str], Any] | None = None,
+    input_fn: Callable[[str], str] = input,
+    getpass_fn: Callable[[str], str] = getpass.getpass,
+) -> bool | None:
+    """Prompt in a terminal, never through MCP stdout.
+
+    With ``verifier`` the login is tried once against KNOSSOS before it is
+    stored; a rejected login is asked for again, at most
+    ``MAX_REJECTED_ENTRIES`` times. Returns ``True`` when the login was
+    confirmed and ``None`` when it was stored without a confirmation.
+    """
     store = secret_store or KeyringSecretStore()
-    username = input("Kobe University username: ").strip()
-    password = getpass.getpass("Kobe University password: ")
-    if not username or not password:
-        raise AuthenticationRequired("Username and password must not be empty")
-    store.set(USERNAME_KEY, username)
-    store.set(PASSWORD_KEY, password)
+    for attempt in range(1, MAX_REJECTED_ENTRIES + 1):
+        username = input_fn("Kobe University username: ").strip()
+        password = getpass_fn("Kobe University password: ")
+        if not username or not password:
+            raise AuthenticationRequired("Username and password must not be empty")
+        verified: bool | None = None
+        if verifier is not None:
+            print("Checking the login with KNOSSOS (up to a minute)...", file=sys.stderr, flush=True)
+            check = verifier(username, password)
+            if check.status == "rejected":
+                left = MAX_REJECTED_ENTRIES - attempt
+                print(
+                    "KNOSSOS rejected the login ID or password; nothing was stored."
+                    + (f" Enter it again ({left} more)." if left else ""),
+                    file=sys.stderr,
+                    flush=True,
+                )
+                continue
+            verified = True if check.status == "ok" else None
+            if verified is None:
+                print(
+                    f"The login could not be checked ({check.detail}); it is stored as entered.",
+                    file=sys.stderr,
+                    flush=True,
+                )
+        store.set(USERNAME_KEY, username)
+        store.set(PASSWORD_KEY, password)
+        clear_login_state(secret_store)
+        return verified
+    raise CredentialsRejected(
+        f"KNOSSOS rejected the login {MAX_REJECTED_ENTRIES} times. Confirm the ID and password "
+        "on the university login page in a browser, then run this command again."
+    )
 
 
 class _DataBlob(ctypes.Structure):

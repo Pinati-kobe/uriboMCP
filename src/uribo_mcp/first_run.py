@@ -254,7 +254,7 @@ def credentials_stored() -> bool | None:
 
 
 def store_credentials(username: str, password: str, secret_store=None) -> None:
-    from uribo_mcp.auth import PASSWORD_KEY, USERNAME_KEY, KeyringSecretStore
+    from uribo_mcp.auth import PASSWORD_KEY, USERNAME_KEY, KeyringSecretStore, clear_login_state
     from uribo_mcp.errors import AuthenticationRequired
 
     username = username.strip()
@@ -263,6 +263,8 @@ def store_credentials(username: str, password: str, secret_store=None) -> None:
     store = secret_store or KeyringSecretStore()
     store.set(USERNAME_KEY, username)
     store.set(PASSWORD_KEY, password)
+    # A newly saved login lifts the pause that a rejected one put on automatic sign-in.
+    clear_login_state(secret_store)
 
 
 def apply_setup(

@@ -13,6 +13,10 @@ class AuthenticationRequired(UriboMcpError):
     """A source requires a new interactive authentication setup."""
 
 
+class CredentialsRejected(AuthenticationRequired):
+    """KNOSSOS showed the login form again: the login ID or password is wrong."""
+
+
 class SyncAlreadyRunning(UriboMcpError):
     """Another process currently owns the sync lock."""
 

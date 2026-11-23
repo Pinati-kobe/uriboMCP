@@ -16,7 +16,7 @@ BEEF+ の授業資料・課題・お知らせ、うりぼーネットの掲示�
 Claude Code や Codex など、PC 上でコマンドを実行できる AI エージェントに次の文を貼ります。
 
 ```text
-https://github.com/AkiraAsano-kobe-u/uriboMCP の docs/install-for-agents.md を読んで、
+https://github.com/Pinati-kobe/uriboMCP の docs/install-for-agents.md を読んで、
 その手順どおりに uriboMCP をこの PC にインストールして。
 ```
 
@@ -32,7 +32,7 @@ Python は uv が自動で用意します。
 winget install --id Git.Git -e
 winget install --id astral-sh.uv -e
 
-git clone https://github.com/AkiraAsano-kobe-u/uriboMCP.git "$env:USERPROFILE\uriboMCP"
+git clone https://github.com/Pinati-kobe/uriboMCP.git "$env:USERPROFILE\uriboMCP"
 cd "$env:USERPROFILE\uriboMCP"
 uv sync
 

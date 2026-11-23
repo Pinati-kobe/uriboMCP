@@ -53,7 +53,7 @@ Google Chrome も必要（大学のログインに使う）。無ければ同じ
 ## 2. 取得して依存を入れる
 
 ```powershell
-git clone https://github.com/AkiraAsano-kobe-u/uriboMCP.git "<INSTALL_DIR>"
+git clone https://github.com/Pinati-kobe/uriboMCP.git "<INSTALL_DIR>"
 cd "<INSTALL_DIR>"
 uv sync
 ```

@@ -12,7 +12,7 @@ uribo-mcp は、神戸大学の BEEF+・LMS BEEF（Moodle）・うりぼーネ�
 
 ツール名の接頭辞はクライアントごとに違います（例: `mcp__uribo-mcp__get_today`、
 `mcp__uribo_mcp__get_today`）。以下は接頭辞を除いた名前です。ツールが見つからなければ、
-uribo-mcp が未登録です。https://github.com/AkiraAsano-kobe-u/uriboMCP の
+uribo-mcp が未登録です。https://github.com/Pinati-kobe/uriboMCP の
 `docs/install-for-agents.md` を案内します。
 
 ## どのツールを使うか

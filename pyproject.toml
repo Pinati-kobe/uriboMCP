@@ -31,8 +31,8 @@ dependencies = [
 ]
 
 [project.urls]
-Repository = "https://github.com/AkiraAsano-kobe-u/uriboMCP"
-Issues = "https://github.com/AkiraAsano-kobe-u/uriboMCP/issues"
+Repository = "https://github.com/Pinati-kobe/uriboMCP"
+Issues = "https://github.com/Pinati-kobe/uriboMCP/issues"
 
 [project.optional-dependencies]
 dev = [

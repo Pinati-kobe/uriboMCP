@@ -173,10 +173,10 @@ def _login_verifier():
 
 def _login_pause() -> str | None:
     """Why automatic KNOSSOS sign-in is paused, if it is; never raises."""
-    from uribo_mcp.auth import load_credentials, login_block_reason
+    from uribo_mcp.auth import login_block_reason
 
     try:
-        return login_block_reason(load_credentials())
+        return login_block_reason()
     except Exception:
         return None
 

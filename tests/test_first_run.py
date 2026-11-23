@@ -728,3 +728,79 @@ def test_cli_passes_no_verifier_with_no_verify(tmp_path: Path, monkeypatch, caps
     main(["--root", str(tmp_path), "setup", "--storage-dir", str(tmp_path / "s")])
     assert callable(seen["verifier"])
     capsys.readouterr()
+
+
+def test_ui_asks_for_the_login_again_while_sign_in_is_paused(tmp_path: Path) -> None:
+    from uribo_mcp.auth import login_block_reason, record_login_failure
+
+    session, server, store = _verified_ui(tmp_path, lambda u, p: _Check("ok"))
+    store.set(USERNAME_KEY, "1234567x")
+    store.set(PASSWORD_KEY, "changed-at-the-university")
+    record_login_failure(rejected=True, secret_store=store)
+    try:
+        _, body, _ = _request(server, "/api/state", token=session.token)
+        assert json.loads(body)["credentials_stored"] is False
+        status, body, _ = _request(
+            server,
+            "/api/save",
+            token=session.token,
+            body={"storage_dir": str(tmp_path / "store"), "sources": ["csi"]},
+        )
+        assert status == 400 and not session.done.is_set()
+        status, body, _ = _save(server, session, tmp_path, "new-password")
+        assert status == 200, body
+    finally:
+        server.shutdown()
+        server.server_close()
+    assert store.get(PASSWORD_KEY) == "new-password"
+    assert login_block_reason(secret_store=store) is None
+
+
+def test_run_setup_ui_waits_for_a_login_check_that_outlasts_the_timeout(tmp_path: Path) -> None:
+    root = tmp_path / "project"
+    root.mkdir()
+    store = MemoryStore()
+    checking = threading.Event()
+
+    def slow_verifier(username: str, password: str):
+        checking.set()
+        threading.Event().wait(1.0)  # still signing in when the form times out
+        return _Check("ok")
+
+    def fill_in_form(url: str) -> None:
+        port, token = url.split(":")[2].split("/")[0], url.split("t=")[1]
+
+        def post() -> None:
+            request = urllib.request.Request(
+                f"http://127.0.0.1:{port}/api/save",
+                data=json.dumps(
+                    {
+                        "storage_dir": str(tmp_path / "store"),
+                        "sources": ["csi"],
+                        "username": "1234567x",
+                        "password": "hunter2-secret",
+                    }
+                ).encode("utf-8"),
+                method="POST",
+            )
+            request.add_header("Content-Type", "application/json")
+            request.add_header(TOKEN_HEADER, token)
+            urllib.request.urlopen(request, timeout=10).read()
+
+        threading.Thread(target=post, daemon=True).start()
+        assert checking.wait(5)
+
+    result = run_setup_ui(
+        root=root,
+        config_path=root / "config.local.toml",
+        initial=first_run.build_plan(tmp_path / "default"),
+        open_browser=False,
+        timeout=0.2,
+        secret_store=store,
+        announce=fill_in_form,
+        verifier=slow_verifier,
+    )
+
+    # Not "timeout": the answer matches what ended up in the keyring.
+    assert result["ok"] is True and result["kobe_credentials_verified"] is True
+    assert store.get(PASSWORD_KEY) == "hunter2-secret"

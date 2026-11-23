@@ -5,8 +5,8 @@ from __future__ import annotations
 import base64
 import ctypes
 import getpass
-import hashlib
 import json
+import logging
 import os
 import sys
 from collections.abc import Callable
@@ -20,11 +20,12 @@ from dotenv import dotenv_values
 
 from uribo_mcp.errors import AuthenticationRequired, CredentialsRejected
 
+LOGGER = logging.getLogger(__name__)
 KEYRING_SERVICE = "uribo-mcp"
 USERNAME_KEY = "kobe-username"
 PASSWORD_KEY = "kobe-password"
-# Outcome of the last KNOSSOS form submissions. It lives next to the password
-# because it holds a fingerprint of the credentials that failed.
+# Outcome of the last KNOSSOS form submissions: counts and a time, nothing
+# derived from the login itself.
 LOGIN_STATE_KEY = "kobe-login-state"
 # A rejected password is never submitted again. A login that failed for an
 # unknown reason (timeout, changed page, extra sign-in step) is retried, but
@@ -98,40 +99,35 @@ def _state_store() -> SecretStore:
     return KeyringSecretStore()
 
 
-def _fingerprint(credentials: KobeCredentials) -> str:
-    raw = f"{credentials.username}\0{credentials.password}".encode()
-    return hashlib.sha256(raw).hexdigest()
-
-
 def _read_login_state(store: SecretStore) -> dict[str, Any]:
     try:
         raw = store.get(LOGIN_STATE_KEY)
         value = json.loads(raw) if raw else {}
-    except Exception:  # an unreadable keyring or entry must not stop a sync
+    except Exception as exc:  # an unreadable keyring or entry must not stop a sync
+        LOGGER.warning("the sign-in record could not be read (%s)", type(exc).__name__)
         return {}
     return value if isinstance(value, dict) else {}
 
 
 def login_block_reason(
-    credentials: KobeCredentials,
     *,
     secret_store: SecretStore | None = None,
     now: datetime | None = None,
 ) -> str | None:
-    """Why these credentials must not be submitted to KNOSSOS now, or ``None``.
+    """Why the saved login must not be submitted to KNOSSOS now, or ``None``.
 
     Repeating a wrong password from every scheduled sync can lock the
     university account, so a failure is remembered across runs. The record
-    applies only to the credentials that failed: saving a new login clears it.
+    says nothing about the login itself; saving a login again removes it.
     """
     state = _read_login_state(secret_store or _state_store())
-    if state.get("fingerprint") != _fingerprint(credentials):
+    if not state:
         return None
     how_to_resume = (
         "Automatic sign-in is paused. Ask the user to run `uv run uribo-mcp setup` "
         "(or `uv run uribo-mcp auth setup`) and enter the login again."
     )
-    if state.get("rejected"):
+    if state.get("rejected") is True:
         return (
             f"KNOSSOS rejected the saved login ID or password ({state.get('at')}). "
             + how_to_resume
@@ -139,12 +135,13 @@ def login_block_reason(
     try:
         failures = int(state.get("failures") or 0)
         last = datetime.fromisoformat(str(state.get("at")))
-    except (TypeError, ValueError):
+        if last.tzinfo is None:
+            last = last.replace(tzinfo=UTC)
+        retry_at = last + timedelta(hours=UNCONFIRMED_RETRY_HOURS)
+        waiting = (now or datetime.now(UTC)) < retry_at
+    except (TypeError, ValueError, OverflowError):
         return None
-    if failures < MAX_UNCONFIRMED_FAILURES:
-        return None
-    retry_at = last + timedelta(hours=UNCONFIRMED_RETRY_HOURS)
-    if (now or datetime.now(UTC)) >= retry_at:
+    if failures < MAX_UNCONFIRMED_FAILURES or not waiting:
         return None
     return (
         f"KNOSSOS sign-in did not complete {failures} times in a row (last {state.get('at')}). "
@@ -153,7 +150,6 @@ def login_block_reason(
 
 
 def record_login_failure(
-    credentials: KobeCredentials,
     *,
     rejected: bool,
     secret_store: SecretStore | None = None,
@@ -161,26 +157,24 @@ def record_login_failure(
 ) -> None:
     """Remember a failed KNOSSOS submission for :func:`login_block_reason`."""
     store = secret_store or _state_store()
-    fingerprint = _fingerprint(credentials)
     previous = _read_login_state(store)
-    failures = 1
-    if previous.get("fingerprint") == fingerprint:
-        try:
-            failures = int(previous.get("failures") or 0) + 1
-        except (TypeError, ValueError):
-            failures = 1
+    try:
+        failures = int(previous.get("failures") or 0) + 1
+    except (TypeError, ValueError):
+        failures = 1
     state = {
-        "fingerprint": fingerprint,
-        "rejected": bool(rejected) or bool(
-            previous.get("fingerprint") == fingerprint and previous.get("rejected")
-        ),
+        "rejected": bool(rejected) or previous.get("rejected") is True,
         "failures": failures,
         "at": (now or datetime.now(UTC)).replace(microsecond=0).isoformat(),
     }
     try:
         store.set(LOGIN_STATE_KEY, json.dumps(state, separators=(",", ":")))
-    except Exception:
-        pass
+    except Exception as exc:
+        # Without the record the next run submits the same login again.
+        LOGGER.warning(
+            "the failed sign-in could not be recorded (%s); the next sync will try again",
+            type(exc).__name__,
+        )
 
 
 def clear_login_state(secret_store: SecretStore | None = None) -> None:
@@ -189,8 +183,8 @@ def clear_login_state(secret_store: SecretStore | None = None) -> None:
     try:
         if store.get(LOGIN_STATE_KEY):
             store.delete(LOGIN_STATE_KEY)
-    except Exception:
-        pass
+    except Exception as exc:
+        LOGGER.warning("the sign-in record could not be removed (%s)", type(exc).__name__)
 
 
 def interactive_setup(

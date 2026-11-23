@@ -85,11 +85,11 @@ def _inject_vault(driver, vault: CookieVault, source: str, base_url: str) -> boo
 def _credentials_for_login() -> KobeCredentials:
     """Saved credentials, refused while automatic sign-in is paused.
 
-    Called before any SSO page is opened, so a missing login and a login that
-    KNOSSOS already rejected both cost no request.
+    Called before the KNOSSOS form is opened or filled in, so neither a
+    missing login nor one that KNOSSOS already rejected is ever submitted.
     """
     credentials = load_credentials()
-    reason = login_block_reason(credentials)
+    reason = login_block_reason()
     if reason:
         raise AuthenticationRequired(reason)
     return credentials
@@ -183,14 +183,14 @@ def _submit_knossos_form(
         final = urlparse(str(driver.current_url)).netloc
     except Exception as exc:
         if track:
-            record_login_failure(credentials, rejected=False)
+            record_login_failure(rejected=False)
         raise AuthenticationRequired(
             f"KNOSSOS login was submitted but did not complete ({type(exc).__name__}); "
             "the server will not retry automatically."
         ) from exc
     if rejected and expected_host not in final:
         if track:
-            record_login_failure(credentials, rejected=True)
+            record_login_failure(rejected=True)
         raise CredentialsRejected(
             "KNOSSOS rejected the login ID or password. Automatic sign-in is paused until "
             "the user runs `uv run uribo-mcp setup` (or `uv run uribo-mcp auth setup`) "
@@ -198,7 +198,7 @@ def _submit_knossos_form(
         )
     if "knossos" in final or expected_host not in final:
         if track:
-            record_login_failure(credentials, rejected=False)
+            record_login_failure(rejected=False)
         raise AuthenticationRequired(
             "KNOSSOS login failed. Credentials, MFA, or the login page may have changed; "
             "the server will not retry automatically."

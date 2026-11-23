@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from datetime import UTC, datetime, timedelta
 
 import pytest
@@ -105,39 +106,57 @@ def saved_login(monkeypatch):
 
 
 # ------------------------------------------------------------ recorded state
-def test_rejected_login_blocks_until_the_credentials_change(login_state_store) -> None:
-    assert login_block_reason(SAVED) is None
-    record_login_failure(SAVED, rejected=True, now=NOW)
+def test_rejected_login_blocks_until_a_login_is_saved_again(login_state_store) -> None:
+    assert login_block_reason() is None
+    record_login_failure(rejected=True, now=NOW)
 
-    reason = login_block_reason(SAVED, now=NOW + timedelta(days=30))
+    reason = login_block_reason(now=NOW + timedelta(days=30))
     assert reason and "rejected" in reason and "uribo-mcp setup" in reason
-    assert "wrong-password" not in login_state_store.get(LOGIN_STATE_KEY)
-    assert "1234567x" not in login_state_store.get(LOGIN_STATE_KEY)
-    # A different password is a different login: it gets its own first attempt.
-    assert login_block_reason(KobeCredentials("1234567x", "new-password")) is None
+    # The record holds counts and a time, nothing derived from the login.
+    assert set(json.loads(login_state_store.get(LOGIN_STATE_KEY))) == {"rejected", "failures", "at"}
 
     clear_login_state()
-    assert login_block_reason(SAVED) is None
+    assert login_block_reason() is None
 
 
 def test_unconfirmed_failures_pause_after_three_and_retry_once_a_day(login_state_store) -> None:
     for attempt in range(1, MAX_UNCONFIRMED_FAILURES):
-        record_login_failure(SAVED, rejected=False, now=NOW + timedelta(hours=attempt))
-        assert login_block_reason(SAVED, now=NOW + timedelta(hours=attempt)) is None
+        record_login_failure(rejected=False, now=NOW + timedelta(hours=attempt))
+        assert login_block_reason(now=NOW + timedelta(hours=attempt)) is None
     last = NOW + timedelta(hours=MAX_UNCONFIRMED_FAILURES)
-    record_login_failure(SAVED, rejected=False, now=last)
+    record_login_failure(rejected=False, now=last)
 
-    assert "3 times in a row" in (login_block_reason(SAVED, now=last + timedelta(hours=1)) or "")
+    assert "3 times in a row" in (login_block_reason(now=last + timedelta(hours=1)) or "")
     retry = last + timedelta(hours=UNCONFIRMED_RETRY_HOURS)
-    assert login_block_reason(SAVED, now=retry) is None
-    record_login_failure(SAVED, rejected=False, now=retry)  # the daily retry failed too
-    assert login_block_reason(SAVED, now=retry + timedelta(hours=1)) is not None
+    assert login_block_reason(now=retry) is None
+    record_login_failure(rejected=False, now=retry)  # the daily retry failed too
+    assert login_block_reason(now=retry + timedelta(hours=1)) is not None
 
 
-def test_unreadable_state_never_blocks_or_raises(login_state_store) -> None:
-    login_state_store.set(LOGIN_STATE_KEY, "{not json")
-    assert login_block_reason(SAVED) is None
+@pytest.mark.parametrize(
+    "record",
+    [
+        "{not json",
+        "[1, 2]",
+        '{"rejected": "false", "failures": "many", "at": "yesterday"}',
+        '{"failures": 3}',
+        '{"failures": 3, "at": "9999-12-31T23:59:59+00:00"}',
+    ],
+)
+def test_damaged_record_never_raises_or_blocks(login_state_store, record: str) -> None:
+    login_state_store.set(LOGIN_STATE_KEY, record)
+    assert login_block_reason(now=NOW) is None
+    record_login_failure(rejected=False, now=NOW)  # and it can be replaced
+    assert json.loads(login_state_store.get(LOGIN_STATE_KEY))["at"] == NOW.isoformat()
 
+
+def test_record_without_a_time_zone_is_read_as_utc(login_state_store) -> None:
+    login_state_store.set(LOGIN_STATE_KEY, '{"failures": 3, "at": "2026-11-23T09:00:00"}')
+    assert login_block_reason(now=NOW + timedelta(hours=1)) is not None
+    assert login_block_reason(now=NOW + timedelta(hours=UNCONFIRMED_RETRY_HOURS)) is None
+
+
+def test_unusable_keyring_is_logged_and_never_raises(caplog) -> None:
     class Broken:
         def get(self, key: str) -> str | None:
             raise RuntimeError("keyring locked")
@@ -148,9 +167,11 @@ def test_unreadable_state_never_blocks_or_raises(login_state_store) -> None:
         def delete(self, key: str) -> None:
             raise RuntimeError("keyring locked")
 
-    assert login_block_reason(SAVED, secret_store=Broken()) is None
-    record_login_failure(SAVED, rejected=True, secret_store=Broken())
-    clear_login_state(Broken())
+    with caplog.at_level("WARNING", logger="uribo_mcp.auth"):
+        assert login_block_reason(secret_store=Broken()) is None
+        record_login_failure(rejected=True, secret_store=Broken())
+        clear_login_state(Broken())
+    assert "could not be recorded (RuntimeError)" in caplog.text
 
 
 # ------------------------------------------------------------- form handling
@@ -172,7 +193,7 @@ def test_form_shown_again_is_a_rejected_login_and_is_never_resubmitted(saved_log
 def test_moodle_sign_in_is_refused_before_the_browser_starts(saved_login, tmp_path) -> None:
     from uribo_mcp.config import load_settings
 
-    record_login_failure(SAVED, rejected=True)
+    record_login_failure(rejected=True)
     with pytest.raises(AuthenticationRequired, match="rejected"):
         live.open_moodle(
             load_settings(root=tmp_path),
@@ -182,11 +203,11 @@ def test_moodle_sign_in_is_refused_before_the_browser_starts(saved_login, tmp_pa
 
 
 def test_successful_login_clears_earlier_failures(saved_login) -> None:
-    record_login_failure(SAVED, rejected=False)
-    record_login_failure(SAVED, rejected=False)
+    record_login_failure(rejected=False)
+    record_login_failure(rejected=False)
     live._submit_knossos_form(FakeKnossos(signed_in), BEEF_HOST)
-    record_login_failure(SAVED, rejected=False)  # counted from one again
-    assert login_block_reason(SAVED) is None
+    record_login_failure(rejected=False)  # counted from one again
+    assert login_block_reason() is None
 
 
 def test_extra_sign_in_step_is_not_reported_as_a_wrong_password(saved_login) -> None:
@@ -194,7 +215,46 @@ def test_extra_sign_in_step_is_not_reported_as_a_wrong_password(saved_login) -> 
     with pytest.raises(AuthenticationRequired) as caught:
         live._submit_knossos_form(driver, BEEF_HOST)
     assert not isinstance(caught.value, CredentialsRejected)
-    assert login_block_reason(SAVED) is None  # one unconfirmed failure does not pause
+    assert login_block_reason() is None  # one unconfirmed failure does not pause
+
+
+def test_three_incomplete_sign_ins_in_a_row_pause_the_next_one(saved_login) -> None:
+    def crash(driver) -> None:
+        raise RuntimeError("browser crashed")
+
+    for after_click in (extra_step, crash, extra_step):
+        assert login_block_reason() is None
+        with pytest.raises(AuthenticationRequired):
+            live._submit_knossos_form(FakeKnossos(after_click), BEEF_HOST)
+    untouched = FakeKnossos(signed_in)
+    with pytest.raises(AuthenticationRequired, match="3 times in a row"):
+        live._submit_knossos_form(untouched, BEEF_HOST)
+    assert untouched.clicks == 0 and untouched.typed == []
+
+
+def test_paused_sync_opens_no_sign_in_page(saved_login, tmp_path, monkeypatch) -> None:
+    """BEEF+ and Uribo-net without saved cookies stop before the SSO start page."""
+    from uribo_mcp.config import load_settings
+
+    record_login_failure(rejected=True)
+    settings = load_settings(root=tmp_path)
+    drivers: list[FakeKnossos] = []
+
+    def factory(**kwargs):
+        driver = FakeKnossos(form_again)
+        driver.set_page_load_timeout = lambda seconds: None
+        driver.execute_script = lambda script: None
+        drivers.append(driver)
+        return driver
+
+    monkeypatch.setattr(live, "make_chrome_driver", factory)
+    with pytest.raises(AuthenticationRequired, match="rejected"):
+        with live.authenticated_lms(settings):
+            pytest.fail("signed in")
+    with pytest.raises(AuthenticationRequired, match="rejected"):
+        live.fetch_uribo_html(settings)
+    assert len(drivers) == 2 and all(driver.closed for driver in drivers)
+    assert all(driver.opened == [] and driver.clicks == 0 for driver in drivers)
 
 
 # ------------------------------------------------------- check before storing
@@ -223,12 +283,12 @@ def test_check_is_unverified_when_the_answer_is_unknown(saved_login) -> None:
     assert stuck.status == "unverified" and stuck.cookies == ()
 
 
-def test_check_ignores_a_pause_on_the_saved_login(saved_login) -> None:
-    record_login_failure(SAVED, rejected=True)
+def test_check_ignores_a_pause_and_leaves_it_for_the_save_to_lift(saved_login) -> None:
+    record_login_failure(rejected=True)
     check = live.check_kobe_login(
         SAVED.username, "corrected", driver_factory=lambda: FakeKnossos(signed_in)
     )
-    assert check.status == "ok"
+    assert check.status == "ok" and login_block_reason() is not None
 
 
 # ------------------------------------------------------------ terminal setup
@@ -253,7 +313,8 @@ def _answers(*values: str):
 
 def test_terminal_setup_asks_again_after_a_rejected_login(capsys) -> None:
     store = _Memory()
-    record_login_failure(SAVED, rejected=True, secret_store=store)
+    record_login_failure(rejected=True, secret_store=store)
+    assert login_block_reason(secret_store=store) is not None
     seen: list[tuple[str, str]] = []
 
     def verifier(username, password):

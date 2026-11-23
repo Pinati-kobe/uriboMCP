@@ -62,10 +62,18 @@ class SetupSession:
         self._lock = threading.Lock()
 
     def _credentials_stored(self) -> bool | None:
+        """Whether a usable login is stored: one that KNOSSOS has not turned down.
+
+        While automatic sign-in is paused the stored login counts as missing,
+        so the form asks for it again instead of finishing with a login that
+        the sync would refuse to use.
+        """
+        from uribo_mcp.auth import PASSWORD_KEY, USERNAME_KEY, login_block_reason
+
+        if login_block_reason(secret_store=self.secret_store) is not None:
+            return False
         if self.secret_store is None:
             return first_run.credentials_stored()
-        from uribo_mcp.auth import PASSWORD_KEY, USERNAME_KEY
-
         return bool(self.secret_store.get(USERNAME_KEY) and self.secret_store.get(PASSWORD_KEY))
 
     def state(self) -> dict[str, Any]:
@@ -113,7 +121,10 @@ class SetupSession:
 
         with self._lock:
             if self.done.is_set():
-                raise ConfigurationError("この設定フォームは保存済みです")
+                saved = bool(self.result and self.result.get("ok"))
+                raise ConfigurationError(
+                    "この設定フォームは保存済みです" if saved else "この設定フォームは終了しています"
+                )
             if not username and not self._credentials_stored():
                 raise ConfigurationError("ログインIDとパスワードを入力してください")
             check = self._check_login(username, password) if username else None
@@ -139,6 +150,22 @@ class SetupSession:
             self.result = result
             self.done.set()
         return result
+
+    def close(self, result: dict[str, Any], wait: float = 240.0) -> None:
+        """End the session with ``result`` unless a save finishes it first.
+
+        A save that is still signing in when the time runs out holds the lock;
+        waiting for it means the caller reports what was really stored and no
+        browser is left running behind a "timeout" answer.
+        """
+        acquired = self._lock.acquire(timeout=wait)
+        try:
+            if not self.done.is_set():
+                self.result = result
+                self.done.set()
+        finally:
+            if acquired:
+                self._lock.release()
 
     def _check_login(self, username: str, password: str):
         """Try the typed login once; raise LoginRejected if KNOSSOS refuses it."""
@@ -341,11 +368,13 @@ def run_setup_ui(
             except Exception:
                 pass
         if not session.done.wait(timeout):
-            return {
-                "ok": False,
-                "reason": "timeout",
-                "detail": f"The setup form was not saved within {int(timeout)} seconds.",
-            }
+            session.close(
+                {
+                    "ok": False,
+                    "reason": "timeout",
+                    "detail": f"The setup form was not saved within {int(timeout)} seconds.",
+                }
+            )
         return session.result or {"ok": False, "reason": "no result"}
     finally:
         # Let the browser receive the save response before the socket closes.
